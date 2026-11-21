@@ -184,7 +184,8 @@ class Launcher:
         def run():
             try: fn()
             except Exception as e:
-                self.root.after(0,lambda:messagebox.showerror("ReallyVisuals Launcher",str(e)))
+                error_text = str(e)
+                self.root.after(0, lambda err=error_text: messagebox.showerror("ReallyVisuals Launcher", err))
                 self.set_busy(False,"Ошибка")
             else: self.set_busy(False,"Готово")
         threading.Thread(target=run,daemon=True).start()
