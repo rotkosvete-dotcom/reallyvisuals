@@ -12,9 +12,21 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
     steps:
       - name: Get source
         uses: actions/checkout@v4
+
+      - name: Locate project files
+        run: |
+          $script = Get-ChildItem -Path . -Recurse -Filter ReallyVisualsLauncher.py -File | Select-Object -First 1
+          if (-not $script) { throw "ReallyVisualsLauncher.py not found in the repository. Upload the files from the archive to the repository root." }
+          $dir = $script.DirectoryName
+          if (-not (Test-Path (Join-Path $dir "reallyvisuals-1.0.0.jar"))) { throw "reallyvisuals-1.0.0.jar must be in the same folder as ReallyVisualsLauncher.py ($dir)." }
+          "PROJECT_DIR=$dir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Project folder: $dir"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -24,21 +36,27 @@ jobs:
       - name: Install build dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pyinstaller minecraft-launcher-lib
+          python -m pip install pyinstaller minecraft-launcher-lib
+
+      - name: Check script syntax
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: python -m py_compile ReallyVisualsLauncher.py
 
       - name: Build Windows executable
+        working-directory: ${{ env.PROJECT_DIR }}
         run: |
-          pyinstaller --noconfirm --clean --onefile --windowed --name ReallyVisualsLauncher --collect-all minecraft_launcher_lib --add-data "reallyvisuals-1.0.0.jar;." ReallyVisualsLauncher.py
+          python -m PyInstaller --noconfirm --clean --onefile --windowed --name ReallyVisualsLauncher --collect-all minecraft_launcher_lib --add-data "reallyvisuals-1.0.0.jar;." ReallyVisualsLauncher.py
+          if (-not (Test-Path "dist/ReallyVisualsLauncher.exe")) { throw "EXE was not created" }
 
       - name: Upload EXE artifact
         uses: actions/upload-artifact@v4
         with:
           name: ReallyVisualsLauncher-Windows
-          path: dist/ReallyVisualsLauncher.exe
+          path: ${{ env.PROJECT_DIR }}/dist/ReallyVisualsLauncher.exe
           if-no-files-found: error
 
       - name: Publish GitHub Release (tag builds only)
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/ReallyVisualsLauncher.exe
+          files: ${{ env.PROJECT_DIR }}/dist/ReallyVisualsLauncher.exe
