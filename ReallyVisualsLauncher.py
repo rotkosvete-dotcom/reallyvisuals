@@ -1,11 +1,13 @@
-import os, sys, json, threading, subprocess, uuid, hashlib, urllib.request, tkinter as tk
+import os, sys, json, shutil, threading, subprocess, uuid, urllib.request, urllib.parse, tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
 
 APP_NAME = "ReallyVisuals"
 ROOT = os.path.dirname(os.path.abspath(__file__))
 RESOURCE_DIR = getattr(sys, "_MEIPASS", ROOT)
 GAME_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), ".minecraft")
-CONFIG = os.path.join(ROOT, "launcher_config.json")
+CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "ReallyVisualsLauncher")
+CONFIG = os.path.join(CONFIG_DIR, "launcher_config.json")
+DEFAULT_CONFIG = {"username": "Player", "version": "1.16.5", "memory": 4, "fabric": True, "accounts": ["Player"]}
 VERSIONS = ["1.12.2", "1.16.5", "1.20.1", "1.20.4", "1.21.1", "1.21.4", "1.21.11"]
 ORANGE = "#ff7918"
 BG = "#101012"
@@ -14,12 +16,45 @@ MUTED = "#85858f"
 WHITE = "#f4f4f5"
 
 def load_config():
+    cfg = dict(DEFAULT_CONFIG)
     try:
-        with open(CONFIG, "r", encoding="utf-8") as f: return json.load(f)
-    except Exception: return {"username": "Player", "version": "1.16.5", "memory": 4, "fabric": True, "accounts": ["Player"]}
+        with open(CONFIG, "r", encoding="utf-8") as f:
+            cfg.update(json.load(f))
+    except Exception:
+        pass
+    return cfg
 
 def save_config(c):
-    with open(CONFIG, "w", encoding="utf-8") as f: json.dump(c, f, ensure_ascii=False, indent=2)
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(CONFIG, "w", encoding="utf-8") as f:
+        json.dump(c, f, ensure_ascii=False, indent=2)
+
+def loader_key(profile_id, version):
+    part = profile_id[len("fabric-loader-"):-len("-" + version)]
+    return tuple(int(n) if n.isdigit() else 0 for n in part.replace("-", ".").split("."))
+
+def find_fabric_profile(lib, version):
+    ids = [x["id"] for x in lib.utils.get_installed_versions(GAME_DIR)]
+    matches = [x for x in ids if x.startswith("fabric-loader-") and x.endswith("-" + version)]
+    return max(matches, key=lambda x: loader_key(x, version)) if matches else None
+
+def download_fabric_api(version, mods_dir):
+    """ReallyVisuals depends on Fabric API, so download it from Modrinth."""
+    for f in os.listdir(mods_dir):
+        if f.lower().startswith("fabric-api") and f.endswith(".jar"):
+            return
+    q = urllib.parse.urlencode({"game_versions": json.dumps([version]), "loaders": json.dumps(["fabric"])})
+    req = urllib.request.Request("https://api.modrinth.com/v2/project/fabric-api/version?" + q,
+                                 headers={"User-Agent": "ReallyVisualsLauncher/1.0"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        versions = json.load(r)
+    if not versions:
+        raise RuntimeError("Не найден Fabric API для Minecraft " + version)
+    f = next((x for x in versions[0]["files"] if x.get("primary")), versions[0]["files"][0])
+    dst = os.path.join(mods_dir, f["filename"])
+    dl = urllib.request.Request(f["url"], headers={"User-Agent": "ReallyVisualsLauncher/1.0"})
+    with urllib.request.urlopen(dl, timeout=60) as r, open(dst, "wb") as out:
+        shutil.copyfileobj(r, out)
 
 class Launcher:
     def __init__(self, root):
@@ -191,10 +226,13 @@ class Launcher:
         threading.Thread(target=run,daemon=True).start()
 
     def get_lib(self):
-        try: import minecraft_launcher_lib
+        try:
+            import minecraft_launcher_lib
         except ImportError:
-            self.root.after(0,lambda:self.status.set("Устанавливаю компонент запуска…"))
-            subprocess.check_call([sys.executable,"-m","pip","install","minecraft-launcher-lib"])
+            if getattr(sys, "frozen", False):
+                raise RuntimeError("В сборку не попал minecraft-launcher-lib. Пересобери EXE через GitHub Actions.")
+            self.root.after(0, lambda: self.status.set("Устанавливаю компонент запуска…"))
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "minecraft-launcher-lib"])
             import minecraft_launcher_lib
         return minecraft_launcher_lib
 
@@ -213,43 +251,51 @@ class Launcher:
 
     def install_mod(self):
         def task():
-            lib=self.get_lib()
-            version="1.16.5"
-            lib.install.install_minecraft_version(version,GAME_DIR)
-            lib.fabric.install_fabric(version,GAME_DIR)
-            mods=os.path.join(GAME_DIR,"mods"); os.makedirs(mods,exist_ok=True)
-            src=os.path.join(RESOURCE_DIR,"reallyvisuals-1.0.0.jar")
-            if not os.path.isfile(src): raise FileNotFoundError("В папке лаунчера нет reallyvisuals-1.0.0.jar")
-            shutil.copy2(src,os.path.join(mods,"reallyvisuals-1.0.0.jar"))
-            self.root.after(0,lambda:messagebox.showinfo("Готово","Fabric для 1.16.5 установлен. ReallyVisuals JAR скопирован в .minecraft/mods."))
-        import shutil
+            lib = self.get_lib()
+            version = "1.16.5"
+            self.set_busy(True, "Загрузка Minecraft 1.16.5…")
+            lib.install.install_minecraft_version(version, GAME_DIR)
+            self.set_busy(True, "Установка Fabric…")
+            lib.fabric.install_fabric(version, GAME_DIR)
+            mods = os.path.join(GAME_DIR, "mods")
+            os.makedirs(mods, exist_ok=True)
+            src = os.path.join(RESOURCE_DIR, "reallyvisuals-1.0.0.jar")
+            if not os.path.isfile(src):
+                raise FileNotFoundError("В сборке нет reallyvisuals-1.0.0.jar")
+            self.set_busy(True, "Загрузка Fabric API…")
+            download_fabric_api(version, mods)
+            shutil.copy2(src, os.path.join(mods, "reallyvisuals-1.0.0.jar"))
+            self.root.after(0, lambda: messagebox.showinfo("Готово", "Fabric и Fabric API для 1.16.5 установлены. ReallyVisuals скопирован в .minecraft/mods."))
         self.worker(task)
 
     def play(self):
-        version=self.cfg.get("version","1.16.5")
+        version = self.cfg.get("version", "1.16.5")
         def task():
-            lib=self.get_lib()
-            # install if missing; for Fabric the installed profile is version-loader
-            use_fabric=self.cfg.get("fabric",True) and version!="1.12.2"
-            target=version
+            lib = self.get_lib()
+            use_fabric = self.cfg.get("fabric", True) and version != "1.12.2"
+            target = version
             if use_fabric:
-                try: lib.fabric.install_fabric(version,GAME_DIR)
-                except Exception: pass
-                # locate installed fabric profile
-                candidates=[x["id"] for x in lib.utils.get_installed_versions(GAME_DIR)]
-                matches=[x for x in candidates if x.startswith("fabric-loader-") and version in x]
-                if matches: target=sorted(matches)[-1]
+                target = find_fabric_profile(lib, version)
+                if not target:
+                    self.set_busy(True, "Установка Fabric…")
+                    lib.fabric.install_fabric(version, GAME_DIR)
+                    target = find_fabric_profile(lib, version)
+                if not target:
+                    raise RuntimeError("Не удалось найти профиль Fabric для " + version)
             else:
-                lib.install.install_minecraft_version(version,GAME_DIR)
-            username=self.cfg.get("username","Player")
-            offline_uuid=uuid.uuid3(uuid.NAMESPACE_DNS,"OfflinePlayer:"+username).hex
-            options={"username":username,"uuid":offline_uuid,"token":"0",
-                     "jvmArguments":[f"-Xmx{self.cfg.get('memory',4)}G"],
-                     "launcherName":"ReallyVisuals","launcherVersion":"1.0.0"}
-            command=lib.command.get_minecraft_command(target,GAME_DIR,options)
-            self.set_busy(True,"Запускаю Minecraft…")
-            subprocess.Popen(command,cwd=GAME_DIR)
-            self.root.after(0,lambda:self.status.set("Minecraft запущен"))
+                installed = [x["id"] for x in lib.utils.get_installed_versions(GAME_DIR)]
+                if version not in installed:
+                    self.set_busy(True, "Загрузка Minecraft " + version + "…")
+                    lib.install.install_minecraft_version(version, GAME_DIR)
+            username = self.cfg.get("username", "Player")
+            offline_uuid = uuid.uuid3(uuid.NAMESPACE_DNS, "OfflinePlayer:" + username).hex
+            options = {"username": username, "uuid": offline_uuid, "token": "0",
+                       "jvmArguments": [f"-Xmx{self.cfg.get('memory', 4)}G"],
+                       "launcherName": "ReallyVisuals", "launcherVersion": "1.0.0"}
+            command = lib.command.get_minecraft_command(target, GAME_DIR, options)
+            self.set_busy(True, "Запускаю Minecraft…")
+            subprocess.Popen(command, cwd=GAME_DIR)
+            self.root.after(0, lambda: self.status.set("Minecraft запущен"))
         self.worker(task)
 
 if __name__ == "__main__":
